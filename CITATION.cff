@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this tutorial, please cite the accompanying paper."
+title: "Estimating a Hierarchical Nearest Neighbor Gaussian Process (HNNGP) for multinomial mode choice with rstan"
+type: software
+authors:
+  - family-names: Villarraga
+    given-names: Daniel F.
+  - family-names: Daziano
+    given-names: Ricardo A.
+repository-code: "https://github.com/dfvillarraga2191/hnngp-multi-tutorial"
+license: MIT
+preferred-citation:
+  type: article
+  title: "Hierarchical Nearest Neighbor Gaussian Process models for discrete choice: Mode choice in New York City"
+  authors:
+    - family-names: Villarraga
+      given-names: Daniel F.
+    - family-names: Daziano
+      given-names: Ricardo A.
+  journal: "Transportation Research Part B: Methodological"
+  volume: 191
+  year: 2025
+  start: 103132
+  doi: "10.1016/j.trb.2024.103132"

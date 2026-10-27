@@ -1,0 +1,90 @@
+/* Lightweight styles for embedding the HNNGP tutorial on a personal/research site */
+
+body {
+  font-family: "Source Sans 3", "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  line-height: 1.55;
+  color: #1f2933;
+}
+
+h1, h2, h3, h4 {
+  font-family: "Source Serif 4", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  color: #102a43;
+  font-weight: 650;
+}
+
+#header {
+  border-bottom: 2px solid #243b53;
+  margin-bottom: 1.5rem;
+  padding-bottom: 0.75rem;
+}
+
+.title {
+  font-size: 1.85rem;
+  margin-bottom: 0.25rem;
+}
+
+#TOC {
+  background: #f5f7fa;
+  border: 1px solid #d9e2ec;
+  border-radius: 4px;
+}
+
+#TOC .toctitle,
+#TOC h2 {
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+}
+
+pre, code {
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.88em;
+}
+
+pre {
+  border: 1px solid #d9e2ec;
+  border-radius: 4px;
+  background: #f8fafc !important;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0 1.5rem;
+  font-size: 0.95rem;
+}
+
+th, td {
+  border-bottom: 1px solid #d9e2ec;
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+}
+
+th {
+  background: #f0f4f8;
+  font-weight: 600;
+}
+
+.callout, .note {
+  background: #e6f0ff;
+  border-left: 4px solid #3b82f6;
+  padding: 0.85rem 1rem;
+  margin: 1.25rem 0;
+  border-radius: 0 4px 4px 0;
+}
+
+.main-container {
+  max-width: 920px !important;
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Keep float TOC usable on narrow screens */
+@media (max-width: 768px) {
+  #TOC {
+    position: relative !important;
+    width: 100% !important;
+  }
+}

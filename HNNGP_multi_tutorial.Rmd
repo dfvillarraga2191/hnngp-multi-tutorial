@@ -1,0 +1,521 @@
+---
+title: "Estimating a Hierarchical Nearest Neighbor Gaussian Process (HNNGP) for Multinomial Mode Choice with `rstan`"
+author: ""
+date: ""
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    self_contained: true
+    css: tutorial.css
+    math_method:
+      engine: mathjax
+      url: https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml-full.js
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = FALSE,      # set TRUE after installing packages; MCMC is expensive
+  message = FALSE,
+  warning = FALSE,
+  comment = "##",
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 4.5
+)
+```
+
+# Overview
+
+This tutorial walks through estimating a **hierarchical nearest neighbor Gaussian process (HNNGP)** for **three-alternative** mode choice using **Stan** via **`rstan`**, following Villarraga and Daziano (2025). The example uses the New York City travel-diary data from that paper. The alternatives are **car**, **transit**, and **non-motorized** (walking or bicycling).
+
+The specification here is the **IIA contrast** model. Car and transit utilities are latent Gaussian processes written as contrasts against non-motorized travel, and the non-motorized utility is fixed at zero. The two processes are independent and share a range and a spatial variance. A companion binary tutorial covers transit versus driving only.
+
+You will:
+
+1. Prepare alternative-specific covariates, socioeconomic shifters, and spatial coordinates
+2. Build the nearest-neighbor (NN) index used by the NNGP
+3. Specify priors and assemble the Stan data list
+4. Fit the model with `rstan`
+5. Summarize posteriors (including value of time)
+6. Compute **effective sample size (ESS)** and **Gelman–Rubin $\widehat{R}$** with the same approach as in `ess_rhats.R`
+
+::: {.callout}
+**Runtime note.** Full MCMC on the example file (about 3,300 observations) with $M=20$ neighbors and 4 chains × 3,000 iterations is computationally heavy: the NNGP likelihood is evaluated twice, once for each contrast. For a first run, subsample the data (e.g. 300–500 rows) or reduce `iter`.
+:::
+
+# Model
+
+For observation $i = 1,\ldots,N$, the outcome $y_i \in \{1,2,3\}$ is car, transit, or non-motorized. Conditional on a latent utility vector $u_i = (u_{i1}, u_{i2}, u_{i3})$,
+
+\[
+y_i \mid u_i \sim \mathrm{Categorical}\bigl(\mathrm{softmax}(u_i)\bigr).
+\]
+
+In Stan this is `categorical_logit`. The third utility is the base alternative and is identically zero, $u_{i3} = 0$. The first two utilities are nearest-neighbor approximations to independent Gaussian processes with a shared partial sill $\sigma^2$, a shared decay $\phi$, and nugget variance fixed at $\tau^2 = 1$:
+
+\[
+\begin{aligned}
+\mathbf{u}_{\cdot 1} &\sim \mathrm{NNGP}\!\left((X_{\mathrm{car}} - X_{\mathrm{non}})\beta + Z\gamma + \mathrm{ASC}_{\mathrm{car}},\; \sigma^2,\, \tau^2,\, \phi\right), \\
+\mathbf{u}_{\cdot 2} &\sim \mathrm{NNGP}\!\left((X_{\mathrm{transit}} - X_{\mathrm{non}})\beta + \mathrm{ASC}_{\mathrm{transit}},\; \sigma^2,\, \tau^2,\, \phi\right), \\
+\mathbf{u}_{\cdot 3} &= \mathbf{0}.
+\end{aligned}
+\]
+
+$X_{\mathrm{car}}$, $X_{\mathrm{transit}}$, and $X_{\mathrm{non}}$ contain travel time and cost. The same generic coefficients $\beta$ multiply every alternative, through the contrasts against non-motorized. $Z$ contains socioeconomic indicators and enters **only the car utility**, with coefficients $\gamma$. A dense GP is $O(N^3)$; the **NNGP** replaces the full covariance with a sparse approximation based on $M$ nearest neighbors (Datta et al., 2016; Finley et al.). Stan evaluates that approximation through a custom `nngp` likelihood. The mode-choice specification, priors, and New York City application follow Villarraga and Daziano (2025).
+
+Conditional on $u_i$, the choice probabilities are multinomial logit, so the odds between two alternatives do not depend on the third. That is the IIA property of this specification. It is not the three-field model in which non-motorized travel has its own spatial residual and the alternatives are allowed a free error correlation.
+
+The exponential correlation is $R(\phi)_{ij} = \exp(-\phi\,\|s_i - s_j\|)$. In this tutorial the coordinates $s_i$ are **trip directions** (destination minus origin lat/lon), the same construction as in the binary tutorial, so nearby observations share similar origin–destination orientations.
+
+Priors used below:
+
+- $\beta \sim \mathcal{N}(0, I_P)$
+- $\gamma \sim \mathcal{N}(0, I_S)$
+- $\mathrm{ASC}_{\mathrm{car}},\ \mathrm{ASC}_{\mathrm{transit}} \sim \mathcal{N}(0, 1)$
+- $\sigma \sim \mathcal{N}^+(1, s_\sigma)$ (truncated via `<lower=0>`)
+- $\phi \sim \mathrm{Gamma}(a_\phi, b_\phi)$ in Stan's shape–rate parameterization
+
+Training versus held-out observations are handled with a binary `mask`: only `mask[n] == 1` contributes to the categorical likelihood. The Gaussian process is still defined at all $N$ locations, so a held-out site is informed by its neighbors.
+
+# Software setup
+
+```{r packages}
+install.packages(c(
+  "rstan", "spNNGP", "tidyverse", "HDInterval",
+  "ggridges", "loo", "sns", "asbio"
+))
+# On macOS you need a working C++ toolchain (Xcode CLT) for rstan.
+```
+
+```{r libraries}
+library(rstan)
+library(tidyverse)
+library(HDInterval)
+library(ggridges)
+library(loo)
+
+source("R/NNMatrix.R")   # builds NN indices via spNNGP::spConjNNGP
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+```
+
+# Data preparation
+
+Load the three-alternative mode-choice file and build the matrices the Stan program expects.
+
+Travel times in the file are in seconds. Dividing car and transit times by 60 expresses them in minutes. Non-motorized time is the average of walking and bicycling, also in minutes: $(\text{walking} + \text{bicycling}) / 120$. The non-motorized money cost is set to 0, as in the IIA specification. Cost for car and transit stays in USD.
+
+```{r load-data}
+my_data <- read.csv(
+  "data/mode_multi.csv",
+  header = TRUE, sep = ",", dec = ".", check.names = FALSE
+)
+my_data <- my_data[complete.cases(my_data), ]
+
+# 1 = car, 2 = transit, 3 = non-motorized
+y <- rep(NA_integer_, nrow(my_data))
+y[my_data$PMODE_R3 == 1]  <- 1L
+y[my_data$PMODE_R3 == 2]  <- 2L
+y[my_data$PMODE_R3 == 97] <- 3L
+stopifnot(!anyNA(y))
+
+X_car <- cbind(
+  time = my_data$T_Driving / 60,
+  cost = my_data$Cost_Driving
+)
+X_public <- cbind(
+  time = my_data$T_Transit / 60,
+  cost = my_data$Cost_Transit
+)
+X_non <- cbind(
+  time = (my_data$T_Walking + my_data$T_Bicycling) / 120,
+  cost = 0
+)
+Socio <- cbind(
+  high_inc  = as.integer(my_data$INCOM_R == 4),
+  male      = as.integer(my_data$GENDER == "Male"),
+  no_veh    = as.integer(my_data$HHVEH_R == 0),
+  manhattan = as.integer(my_data$GEO_GROUP1_D == 1)
+)
+
+s_o <- as.matrix(my_data[, c("INTPTLAT", "INTPTLONG")])
+s_d <- as.matrix(my_data[, c("DLAT", "DLONG")])
+s   <- s_d - s_o   # trip direction
+N   <- nrow(s)
+
+# Optional demo subsample. Apply it before the mask and the neighbor graph.
+# set.seed(42); keep <- sample(N, 400)
+# y <- y[keep]
+# X_car <- X_car[keep, , drop = FALSE]
+# X_public <- X_public[keep, , drop = FALSE]
+# X_non <- X_non[keep, , drop = FALSE]
+# Socio <- Socio[keep, , drop = FALSE]
+# s <- s[keep, , drop = FALSE]
+# N <- nrow(s)
+
+train_prop <- 0.8
+set.seed(42)
+mask <- sample(c(1L, 0L), N, replace = TRUE,
+               prob = c(train_prop, 1 - train_prop))
+
+table(y)
+mean(mask)   # ~ training fraction
+```
+
+Socioeconomic indicators shift the car utility only. Transit has its own alternative-specific constant, and non-motorized travel is the base alternative.
+
+# Nearest-neighbor matrix
+
+The helper `NNMatrix()` (in `R/NNMatrix.R`) uses `spNNGP` to order locations and return neighbor indices and distances required by the Stan NNGP density.
+
+```{r nn-matrix}
+M <- 20   # number of neighbors
+NN.matrix <- NNMatrix(
+  coords = s,
+  n.neighbors = M,
+  n.omp.threads = 2,
+  ord = order(s[, 1])   # order along the first coordinate axis
+)
+str(NN.matrix, max.level = 1)
+```
+
+Returned objects:
+
+| Object | Role in Stan |
+|--------|----------------|
+| `ord` | Permutation used to sort the outcome, covariates, and mask |
+| `NN_ind` | Neighbor indices for locations $2,\ldots,N$ |
+| `NN_dist` | Distances to those neighbors |
+| `NN_distM` | Packed pairwise distances among neighbors |
+
+::: {.callout}
+**Sort the mask with everything else.** `y`, `X_car`, `X_public`, `X_non`, `Socio`, and `mask` must all be indexed by `NN.matrix$ord` before calling Stan. The neighbor matrices are already in that order. Leaving `mask` in the original row order assigns training labels to the wrong people.
+:::
+
+You can visually check neighbors for observation `ind` with `Check_Neighbors(NN.matrix$coords.ord, M, NN.matrix, ind)`.
+
+# Priors and Stan data list
+
+```{r priors}
+P   <- ncol(X_car)     # generic time and cost
+S   <- ncol(Socio)     # shifters of the car utility
+uB  <- rep(0, P)
+VB  <- diag(P)
+ugm <- rep(0, S)
+Vgm <- diag(S)
+ss  <- 0.5             # scale for sigma ~ Normal(1, ss)
+st  <- 0.001           # placeholder (tausq is fixed in Stan)
+ap  <- 3; bp <- 0.5    # phi ~ Gamma(shape = ap, rate = bp); prior mean is ap/bp = 6
+
+ord <- NN.matrix$ord
+stan_data <- list(
+  N = N, M = M, P = P, S = S,
+  y = y[ord],
+  X_car = X_car[ord, , drop = FALSE],
+  X_public = X_public[ord, , drop = FALSE],
+  X_non = X_non[ord, , drop = FALSE],
+  Socio = Socio[ord, , drop = FALSE],
+  NN_ind  = NN.matrix$NN_ind,
+  NN_dist = NN.matrix$NN_dist,
+  NN_distM = NN.matrix$NN_distM,
+  mask = mask[ord],
+  uB = uB, VB = VB, ugm = ugm, Vgm = Vgm,
+  ss = ss, st = st, ap = ap, bp = bp
+)
+```
+
+With `ap = 3` and `bp = 0.5`, `phi ~ gamma(ap, bp)` is a gamma prior with shape 3 and rate 0.5, hence mean 6. It is not an inverse-gamma prior.
+
+# Stan program (IIA multinomial HNNGP)
+
+The model file is `stan/nngp_multinomial.stan`. Conceptually:
+
+```stan
+parameters {
+  vector[P] beta;
+  vector[S] gm;
+  real asc_car;
+  real asc_public;
+  matrix[N, 2] u_raw;
+  real<lower=0> sigma;
+  real<lower=0> phi;
+}
+transformed parameters {
+  real sigmasq = square(sigma);
+  matrix[N, 3] u = append_col(u_raw, zeros);  // third column is 0
+}
+model {
+  beta ~ multi_normal_cholesky(uB, L_VB);
+  gm   ~ multi_normal_cholesky(ugm, L_Vgm);
+  asc_car ~ normal(0, 1);
+  asc_public ~ normal(0, 1);
+  phi ~ gamma(ap, bp);
+  sigma ~ normal(1, ss);
+  u[:, 1] ~ nngp((X_car - X_non) * beta + Socio * gm + asc_car,
+                 sigmasq, tausq, phi, NN_dist, NN_distM, NN_ind, N, M);
+  u[:, 2] ~ nngp((X_public - X_non) * beta + asc_public,
+                 sigmasq, tausq, phi, NN_dist, NN_distM, NN_ind, N, M);
+  for (n in 1:N) {
+    if (mask[n] == 1)
+      y[n] ~ categorical_logit(u[n]');
+  }
+}
+```
+
+The custom `nngp_lpdf` implements the NNGP sparse factorization using the neighbor distances and exponential kernel $e^{-\phi d}$. The same function is used for both contrasts. `tausq` is fixed at 1 inside the Stan program; the data variable `st` is accepted and not used.
+
+`log_lik` and `y_est` in `generated quantities` are computed for every row, including rows with `mask[n] == 0`. A sum of `log_lik` is therefore not the training likelihood by itself.
+
+# Fitting with `rstan`
+
+```{r fit}
+parameters <- c(
+  "beta", "gm", "asc_car", "asc_public",
+  "sigmasq", "phi", "log_lik", "y_est"
+)
+
+fit <- stan(
+  file = "stan/nngp_multinomial.stan",
+  data = stan_data,
+  pars = parameters,
+  chains = 4,
+  iter = 3000,
+  warmup = 1000,
+  refresh = 50
+)
+
+print(fit, pars = c("beta", "gm", "asc_car", "asc_public", "sigmasq", "phi"),
+      probs = c(0.025, 0.5, 0.975))
+dir.create("results", showWarnings = FALSE)
+saveRDS(fit, "results/hnngp_multinomial_fit.rds")
+```
+
+Coefficient mapping:
+
+| Stan | Interpretation |
+|------|----------------|
+| `beta[1]` | Travel time (minutes), generic |
+| `beta[2]` | Travel cost (USD), generic |
+| `gm[1]` | High income, on the car utility |
+| `gm[2]` | Male, on the car utility |
+| `gm[3]` | No household vehicle, on the car utility |
+| `gm[4]` | Manhattan destination, on the car utility |
+| `asc_car` | Car alternative-specific constant |
+| `asc_public` | Transit alternative-specific constant |
+| `sigmasq` | Spatial variance $\sigma^2$, shared by both contrasts |
+| `phi` | Exponential decay, shared by both contrasts |
+
+Non-motorized travel has no constant and no socioeconomic coefficients. Its time and cost enter only as the quantity subtracted inside the car and transit contrasts.
+
+# Posterior summaries
+
+Extract draws and report means, medians, and 95% highest-density intervals (HDIs).
+
+```{r post-summaries}
+post <- rstan::extract(
+  fit,
+  pars = c("beta", "gm", "asc_car", "asc_public", "sigmasq", "phi")
+)
+
+summarize_draws <- function(x, name) {
+  h <- unname(hdi(x, credMass = 0.95))
+  tibble(
+    parameter = name,
+    mean = mean(x),
+    median = median(x),
+    hdi_low = h[1],
+    hdi_high = h[2]
+  )
+}
+
+beta_names <- c("time", "cost")
+gm_names <- c("high_inc", "male", "no_veh", "manhattan")
+bind_rows(
+  bind_rows(lapply(seq_along(beta_names), function(j) {
+    summarize_draws(post$beta[, j], beta_names[j])
+  })),
+  bind_rows(lapply(seq_along(gm_names), function(j) {
+    summarize_draws(post$gm[, j], gm_names[j])
+  })),
+  summarize_draws(post$asc_car, "ASC_car"),
+  summarize_draws(post$asc_public, "ASC_transit"),
+  summarize_draws(post$sigmasq, "sigmasq"),
+  summarize_draws(post$phi, "phi")
+)
+```
+
+## Value of time (VOT)
+
+Time enters in minutes and cost in USD, so the ratio $\beta_t / \beta_c$ is USD per minute. Scaling by 60 reports USD per hour:
+
+\[
+\mathrm{VOT} = 60 \times \frac{\beta_t}{\beta_c} \quad [\mathrm{USD/hr}].
+\]
+
+```{r vot}
+vot <- (post$beta[, 1] / post$beta[, 2]) * 60
+summarize_draws(vot, "VOT (USD/hr)")
+```
+
+## Trace plots
+
+```{r traces, fig.height=8}
+p <- plot(
+  fit, plotfun = "trace",
+  pars = c("beta[1]", "beta[2]",
+           "gm[1]", "gm[2]", "gm[3]", "gm[4]",
+           "asc_car", "asc_public", "sigmasq", "phi"),
+  inc_warmup = TRUE
+)
+p
+```
+
+## Density / HDI ridge plot (example: cost)
+
+```{r hdi-cost, fig.height=4}
+bc <- as.numeric(post$beta[, 2])
+hdi_bc <- unname(hdi(bc, credMass = 0.95))
+
+ggplot(tibble(bc), aes(x = bc, y = 0, fill = after_stat(quantile))) +
+  geom_density_ridges_gradient(
+    quantile_lines = TRUE, quantile_fun = hdi,
+    vline_linetype = 5, show.legend = FALSE
+  ) +
+  scale_fill_manual(values = c("transparent", "lightblue", "transparent")) +
+  labs(
+    title = "95% HDI for the cost coefficient",
+    x = expression(beta[c]), y = "density"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+## Predictive check on held-out cases
+
+`y_est` are posterior predictive draws of the chosen alternative. A simple accuracy measure uses the posterior mode on test rows (`mask == 0`). Indices follow the neighbor ordering, the same order Stan used.
+
+```{r test-acc}
+get_mode <- function(x) {
+  ux <- table(x)
+  as.integer(names(ux)[which.max(ux)])
+}
+
+y_ord <- y[NN.matrix$ord]
+mask_ord <- mask[NN.matrix$ord]
+y_est <- rstan::extract(fit, "y_est")$y_est  # iterations x N
+
+test_idx <- which(mask_ord == 0)
+pred_mode <- apply(y_est[, test_idx, drop = FALSE], 2, get_mode)
+test_acc <- mean(pred_mode == y_ord[test_idx])
+test_acc
+```
+
+## PSIS-LOO (optional)
+
+`loo(fit)` uses the pointwise `log_lik` vector. In this program that vector includes held-out rows, whose categorical likelihood was not part of the posterior. Treat the result as a descriptive score on the full file, not as a training-only LOO.
+
+```{r loo}
+loo(fit)
+```
+
+# MCMC diagnostics: ESS and $\widehat{R}$
+
+After sampling, check that chains mixed and that you have enough effective draws. The script `R/ess_rhats.R` mirrors the original `ess_rhats.R` workflow: for each parameter, sum chain-wise **ESS** from `sns::ess(..., method = c("coda", "ise"))` and compute **$\widehat{R}$** with `asbio::R.hat` on the matrix of post-warmup draws.
+
+The script assumes **4 chains, 3000 iterations, and 1000 warmup** draws, matching the `stan()` call above. If you change the sampler settings, edit `iterations` and `warmup` in `R/ess_rhats.R` to the same numbers.
+
+```{r ess-rhat}
+library(sns)
+library(asbio)
+
+iterations <- 3000
+warmup     <- 1000
+post_start <- warmup + 1
+
+c1 <- fit@sim[["samples"]][[1]]
+c2 <- fit@sim[["samples"]][[2]]
+c3 <- fit@sim[["samples"]][[3]]
+c4 <- fit@sim[["samples"]][[4]]
+
+par_list <- c(
+  "beta[1]", "beta[2]",
+  "gm[1]", "gm[2]", "gm[3]", "gm[4]",
+  "asc_car", "asc_public",
+  "sigmasq", "phi"
+)
+
+ess_rhat <- lapply(par_list, function(par) {
+  posts <- list(
+    c1[[par]][post_start:iterations],
+    c2[[par]][post_start:iterations],
+    c3[[par]][post_start:iterations],
+    c4[[par]][post_start:iterations]
+  )
+  ess_total <- sum(vapply(posts, function(z) ess(z, method = c("coda", "ise")), numeric(1)))
+  rhat <- R.hat(do.call(cbind, posts))
+  data.frame(parameter = par, ESS = ess_total, R_hat = rhat)
+})
+ess_rhat <- do.call(rbind, ess_rhat)
+ess_rhat
+```
+
+Or simply, after `fit` exists:
+
+```{r source-ess}
+source("R/ess_rhats.R")
+```
+
+### How to read the diagnostics
+
+- **$\widehat{R}$ (Gelman–Rubin):** values close to **1** (commonly $< 1.01$ or at least $< 1.05$) indicate chain agreement. Large $\widehat{R}$ means you should run longer, reparameterize, or check for multimodality / identification issues.
+- **ESS:** effective independent draws after accounting for autocorrelation. Higher is better; very low ESS relative to the number of post-warmup draws signals sticky sampling. Report ESS alongside posterior means and intervals.
+
+These two quantities complement Stan’s built-in `summary(fit)` (which also reports `n_eff` and `Rhat` using the Stan/rstan definitions). The `sns` / `asbio` versions match the diagnostics workflow in Villarraga and Daziano (2025) and in `ess_rhats.R` when you need that specific implementation.
+
+# Repository layout
+
+```text
+hnngp-multi-tutorial/
+├── README.md
+├── HNNGP_multi_tutorial.Rmd    # this tutorial (source)
+├── docs/
+│   ├── HNNGP_multi_tutorial.html   # website-ready HTML
+│   └── tutorial.css
+├── data/
+│   └── mode_multi.csv
+├── R/
+│   ├── NNMatrix.R              # neighbor construction
+│   └── ess_rhats.R             # ESS and R-hat
+├── stan/
+│   └── nngp_multinomial.stan   # IIA multinomial HNNGP
+└── scripts/
+    └── fit_hnngp.R             # end-to-end script
+```
+
+From the `hnngp-multi-tutorial/` directory:
+
+```r
+source("scripts/fit_hnngp.R")
+```
+
+# References (selected)
+
+- Villarraga, D. F., & Daziano, R. A. (2025). Hierarchical Nearest Neighbor Gaussian Process models for discrete choice: Mode choice in New York City. *Transportation Research Part B: Methodological*, 191, 103132. <https://doi.org/10.1016/j.trb.2024.103132>
+- Datta, A., Banerjee, S., Finley, A. O., & Gelfand, A. E. (2016). Hierarchical Nearest-Neighbor Gaussian Process models for large geostatistical datasets. *Journal of the American Statistical Association*, 111(514), 800–812.
+- Finley, A. O., Datta, A., & Banerjee, S. — `spNNGP` R package.
+- Stan Development Team — Stan / `rstan` User’s Guide (NUTS, diagnostics).
+- Gelman, A., & Rubin, D. B. (1992). Inference from iterative simulation using multiple sequences. *Statistical Science*.
+
+# Session info
+
+```{r session, eval=TRUE}
+sessionInfo()
+```
